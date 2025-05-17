@@ -10,19 +10,39 @@
 [04] ESC5     [10] SRV5     [18] SDA ⇨ BMP280
 [05] ESC6     [11]          [19] SCL ⇨ BMP280
               [12]          [24] CS  ⇨ MPU9250 NCS
-*/
+
+========================================================================================================================
+Table of Contents [Ctrl + F]
+
+1. Definition
+  a. Libraries
+  b. Variables
+2. Main Setup
+  a. Sensors Int
+  b. 
+  c. 
+3. Loop
+  a. 
+  b. 
+  c. 
+
+
+========================================================================================================================*/
+
+
+
 
 
 /*
 ============================================================
-🛩 Include
-============================================================
-*/
+🛩 Libraries
+============================================================*/
 #include "mpu9250.h"
 #include <BMP280.h>
 #include <PulsePosition.h>
 #include <TinyGPS++.h>
 #include <PWMServo.h>
+#include <BasicLinearAlgebra.h>
 
 /* Mpu9250 object, SPI bus, CS on pin 24 */
 bfs::Mpu9250 imu(&SPI, 24);
@@ -30,11 +50,12 @@ BMP280 bmp280;
 PulsePositionInput ReceiverInput(RISING);
 TinyGPSPlus gps;
 HardwareSerial &gpsSerial = Serial4;
+using namespace BLA;
+
 /*
 ============================================================
 🛩 Variables
-============================================================
-*/
+============================================================*/
 unsigned long channel_1_fs = 1500; //elev
 unsigned long channel_2_fs = 1500; //ail
 unsigned long channel_3_fs = 1000; //thro
@@ -50,6 +71,24 @@ float B_mag = 1.0;        //Magnetometer LP filter parameter
 float accx, accy, accz;
 float gyrox, gyroy, gyroz;
 float magx, magy, magz;
+float phi_a, theta_a, psi_a;
+float phi_g, theta_g, psi_g;
+float psi_m;
+uint32_t LoopTimer;
+float phi_k=0, theta_k=0, psi_k=0;
+float phi_k_U=2*2,theta_k_U=2*2; //Uncertainty
+float Kalman1DOutput[]={0,0};
+float phi, theta, psi;
+
+float sin_roll = sin(phi_a);
+float cos_roll = cos(phi_a);
+float sin_pitch = sin(theta_a);
+float cos_pitch = cos(theta_a);
+
+float mag_x = magx * cos_pitch + magz * sin_pitch;
+float mag_y = magx * sin_roll * sin_pitch + magy * cos_roll - magz * sin_roll * cos_pitch;
+
+
 float temperature;
 float ReceiverValue[]={0, 0, 0, 0, 0, 0, 0, 0};
 float ch1,ch2,ch3,ch4,ch5,ch6,ch7,ch8;
@@ -97,6 +136,9 @@ bool armedFly = false;
 
 uint32_t pressure;
 
+//Definition
+#define PI 3.1415926535897932384626433832795
+
 /* Biases */
 float gyro_bias[3] = {0};
 float acc_bias[3] = {0};
@@ -139,17 +181,20 @@ void loop() {
   armedStatus();
   getDesState();
   PPMinput();
-  controlMixer();   //test         d
-  scaleCommands();   //test        d
-  throttleCut();   //test          d
-  //commandMotors();   //test
+  KalmanFilter();
+  controlMixer();
+  scaleCommands();
+  throttleCut();
+  commandMotors();   //test
   PWMloop();       //test
   failSafe();
   GPS();
 //--------Serial Monitor--------
   PrintSensorData();
-  printPPM();
-  printGPS();
+  printStates();
+  //printPPM();
+  //printGPS();
+  //printDes();
 }
 
 /*
@@ -195,10 +240,9 @@ void calibrateIMU(unsigned long duration_ms) {
   if (count > 0) {
     for (int i = 0; i < 3; i++) {
       gyro_bias[i] = sum_gyro[i] / count;
-      acc_bias[i] = sum_acc[i] / count;
+      acc_bias[i] = 0;
       mag_bias[i] = 0;
     }
-    acc_bias[2] += 9.81;
   }
 
   Serial.println("Calibration Complete.");
@@ -208,8 +252,7 @@ void calibrateIMU(unsigned long duration_ms) {
 /*
 ============================================================
 🛩 PWM Int
-============================================================
-*/
+============================================================*/
 void PWMint() {
   pinMode(m1Pin, OUTPUT);
   pinMode(m2Pin, OUTPUT);
@@ -326,19 +369,29 @@ void GPS() {
 
                                                   State Estimation
 
-========================================================================================================================
-*/
+========================================================================================================================*/
+
+/*
+============================================================
+🛩 Phi(Roll) Theta(Pitch) Psi(Yaw)
+============================================================*/
+void KalmanFilter() {
+  //Angle from IMU (rad)
+  phi_a = atan2(-accy,sqrt(accx*accx + accz*accz));
+  theta_a = atan2(accx,sqrt(accy*accy + accz*accz));
+
+  psi_m = atan2(-magy, magx);
+}
 
 /*
 ============================================================
 🛩 Control Mixer Loop
-============================================================
-*/
+============================================================*/
 void controlMixer() {
-  m1_command_scaled = thro_des - pitch_des + roll_des + yaw_des;//FL
-  m2_command_scaled = thro_des - pitch_des - roll_des - yaw_des;//FR
-  m3_command_scaled = thro_des + pitch_des - roll_des + yaw_des;//BR
-  m4_command_scaled = thro_des + pitch_des + roll_des - yaw_des;//BL
+  m1_command_scaled = thro_des + roll_des/maxRoll*0.1 - pitch_des/maxPitch*0.1 - yaw_des/maxYaw*0.1;//FL
+  m2_command_scaled = thro_des + roll_des/maxRoll*0.1 + pitch_des/maxPitch*0.1 + yaw_des/maxYaw*0.1;//BL
+  m3_command_scaled = thro_des - roll_des/maxRoll*0.1 - pitch_des/maxPitch*0.1 + yaw_des/maxYaw*0.1;//FR
+  m4_command_scaled = thro_des - roll_des/maxRoll*0.1 + pitch_des/maxPitch*0.1 - yaw_des/maxYaw*0.1;//BR
   m5_command_scaled = 0;
 
   //0.5 is centered servo, 0.0 is zero throttle if connecting to ESC for conventional PWM, 1.0 is max throttle
@@ -360,8 +413,7 @@ void armedStatus() {
 /*
 ============================================================
 🛩 Scale Commands Loop
-============================================================
-*/
+============================================================*/
 void scaleCommands() {
 
   //Scaled to 125us - 250us for oneshot125 protocol
@@ -397,8 +449,7 @@ void scaleCommands() {
 /*
 ============================================================
 🛩 Desired State Loop
-============================================================
-*/
+============================================================*/
 void getDesState() {
   thro_des = (ch3 - 1000.0)/1000.0; //Between 0 and 1
   roll_des = (ch1 - 1500.0)/500.0; //Between -1 and 1
@@ -517,7 +568,7 @@ void commandMotors() {
 ============================================================
 */
 void PWMloop() {
-  commandMotors(); //Sends command pulses to each motor pin using OneShot125 protocol
+  //commandMotors(); //Sends command pulses to each motor pin using OneShot125 protocol
   servo1.write(s1_command_PWM); //Writes PWM value to servo object
   servo2.write(s2_command_PWM);
   servo3.write(s3_command_PWM);
@@ -543,7 +594,7 @@ void throttleCut() {
       channel_5_pwm is LOW then throttle cut is OFF and throttle value can change. (ThrottleCut is DEACTIVATED)
       channel_5_pwm is HIGH then throttle cut is ON and throttle value = 120 only. (ThrottleCut is ACTIVATED), (drone is DISARMED)
   */
-  if ((ch5 > 1500) || (armedFly == false)) {
+  if ((ch5 < 1500) || (armedFly == false)) {
     armedFly = false;
     m1_command_PWM = 120;
     m2_command_PWM = 120;
@@ -593,6 +644,15 @@ void PrintSensorData() {
   Serial.print(pressure); Serial.print("\t"); Serial.print("\n");
 }
 
+void printStates() {
+  Serial.println("");
+  Serial.println("Phi(roll)\tTheta(pitch)\tPsi(yaw)");
+  Serial.print(phi_a/(PI/180)); Serial.print("\t\t");
+  Serial.print(theta_a/(PI/180)); Serial.print("\t\t");
+  Serial.print(psi_m/(PI/180)); Serial.print("\t");
+  Serial.print("\n");
+}
+
 void printPPM() {
   Serial.println("");
   Serial.print("Number of channels: ");
@@ -614,6 +674,11 @@ void printPPM() {
   Serial.print("ch8(VRB): ");
   Serial.println(ch8);
   Serial.println();
+}
+
+void printDes() {
+  Serial.print("roll_des: ");
+  Serial.print(roll_des);
 }
 
 void printGPS() {
