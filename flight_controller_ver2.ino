@@ -3,13 +3,13 @@
 🛩 Teensy 4.1 Flight Controller Pin Mapping
 ============================================================
 
-[00] ESC1     [06] SRV1     [14] 
-[01] ESC2     [07] SRV2     [15] PPM Receiver
-[02] ESC3     [08] SRV3     [16] RX4 ⇨ GPS TX
-[03] ESC4     [09] SRV4     [17] TX4 ⇦ GPS RX
-[04] ESC5     [10] SRV5     [18] SDA ⇨ BMP280
-[05] ESC6     [11]          [19] SCL ⇨ BMP280
-              [12]          [24] CS  ⇨ MPU9250 NCS
+[00] ESC1     [05] SRV1     [14] 
+[01] ESC2     [06] SRV2     [15] PPM Receiver
+[02] ESC3     [07] SRV3     [16] RX4 ⇨ GPS TX
+[03] ESC4     [08] SRV4     [17] TX4 ⇦ GPS RX
+[04] ESC5     [09] SRV5     [18] SDA ⇨ BMP280
+              [10] SRV6     [19] SCL ⇨ BMP280
+                            [24] CS  ⇨ MPU9250 NCS
 
 ========================================================================================================================
 Table of Contents [Ctrl + F]
@@ -19,12 +19,12 @@ Table of Contents [Ctrl + F]
   b. Variables
 2. Main Setup
   a. Sensors Int
-  b. 
+  b. PWM Int
   c. 
 3. Loop
-  a. 
-  b. 
-  c. 
+  a. Sensors Loop
+  b. Receiver Loop
+  c. GPS Loop
 
 
 ========================================================================================================================*/
@@ -43,6 +43,7 @@ Table of Contents [Ctrl + F]
 #include <TinyGPS++.h>
 #include <PWMServo.h>
 #include <BasicLinearAlgebra.h>
+#include <PID_v1.h>
 
 /* Mpu9250 object, SPI bus, CS on pin 24 */
 bfs::Mpu9250 imu(&SPI, 24);
@@ -63,21 +64,13 @@ unsigned long channel_4_fs = 1500; //rudd
 unsigned long channel_5_fs = 2000; //throttle cut
 unsigned long channel_6_fs = 1000; //aux1
 
-//Filter parameters - Defaults tuned for 2kHz loop rate; Do not touch unless you know what you are doing:
-float B_accel = 0.2;     //Accelerometer LP filter paramter, (MPU6050 default: 0.14. MPU9250 default: 0.2)
-float B_gyro = 0.17;       //Gyro LP filter paramter, (MPU6050 default: 0.1. MPU9250 default: 0.17)
-float B_mag = 1.0;        //Magnetometer LP filter parameter
-
 float accx, accy, accz;
 float gyrox, gyroy, gyroz;
 float magx, magy, magz;
 float phi_a, theta_a, psi_a;
 float phi_g, theta_g, psi_g;
 float psi_m;
-uint32_t LoopTimer;
-float phi_k=0, theta_k=0, psi_k=0;
-float phi_k_U=2*2,theta_k_U=2*2; //Uncertainty
-float Kalman1DOutput[]={0,0};
+
 float phi, theta, psi;
 
 float sin_roll = sin(phi_a);
@@ -97,10 +90,17 @@ float lat,lon,alt,Gvel,sat;
 
 int ChannelNumber=0;
 
+//Kalman Filter Parameters
+float gyrox_cal, gyroy_cal, gyroz_cal;
+int RateCalibrationNumber;
+float phi_k=0, theta_k=0, psi_k=0;
+float phi_k_U=2*2,theta_k_U=2*2,psi_k_U=2*2; //Uncertainty
+float Kalman1DOutput[]={0,0};
+
 //Controller parameters (take note of defaults before modifying!): 
-float maxRoll = 30.0;     //Max roll angle in degrees for angle mode (maximum ~70 degrees), deg/sec for rate mode 
-float maxPitch = 30.0;    //Max pitch angle in degrees for angle mode (maximum ~70 degrees), deg/sec for rate mode
-float maxYaw = 160.0;     //Max yaw rate in deg/sec
+float maxRoll = 30.0*(PI/180);     //Max roll angle in degrees for angle mode (maximum ~70 degrees), deg/sec for rate mode 
+float maxPitch = 30.0*(PI/180);    //Max pitch angle in degrees for angle mode (maximum ~70 degrees), deg/sec for rate mode
+float maxYaw = 160.0*(PI/180);     //Max yaw rate in deg/sec
 
 //OneShot125 ESC pin outputs:
 const int m1Pin = 0;
@@ -124,6 +124,19 @@ PWMServo servo6;
 
 //Normalized desired state:
 float thro_des, roll_des, pitch_des, yaw_des;
+float p_des, q_des, r_des;
+
+//PID
+double Kp_phi=0.3, Kp_theta=0.3, Kp_psi=2;
+double Ki_phi=0.05, Ki_theta=0.05, Ki_psi=0.1;
+double Kd_phi=0.001, Kd_theta=0.001, Kd_psi=0;
+
+//testing Lab-------------------------------------------------------
+double phi_Setpoint, phi_Input, phi_PID;
+PID myphiPID(&phi_Input, &phi_PID, &phi_Setpoint, Kp_phi, Ki_phi, Kd_phi, DIRECT);
+double theta_Setpoint, theta_Input, theta_PID;
+PID mythetaPID(&theta_Input, &theta_PID, &theta_Setpoint, Kp_theta, Ki_theta, Kd_theta, DIRECT);
+//------------------------------------------------------------------
 
 //Mixer
 float m1_command_scaled, m2_command_scaled, m3_command_scaled, m4_command_scaled, m5_command_scaled;
@@ -135,6 +148,7 @@ int s1_command_PWM, s2_command_PWM, s3_command_PWM, s4_command_PWM, s5_command_P
 bool armedFly = false;
 
 uint32_t pressure;
+uint32_t LoopTimer;
 
 //Definition
 #define PI 3.1415926535897932384626433832795
@@ -168,6 +182,17 @@ void setup() {
   bmp280.begin();
   Serial.println("Wating for ESC...");
   PWMint();
+
+//testing Loop-----------------------
+  phi_Input = phi_k;
+  theta_Input = theta_k;
+
+  myphiPID.SetOutputLimits(-255, 255);
+  mythetaPID.SetOutputLimits(-255, 255);
+  myphiPID.SetMode(AUTOMATIC);
+  mythetaPID.SetMode(AUTOMATIC);
+
+//------------------------------------
 }
 
 /*
@@ -181,18 +206,32 @@ void loop() {
   armedStatus();
   getDesState();
   PPMinput();
-  KalmanFilter();
+  AngleEstimate();
+  Phi_Theta_Est();
   controlMixer();
   scaleCommands();
   throttleCut();
-  commandMotors();   //test
-  PWMloop();       //test
+  commandMotors();
+  PWMloop();
   failSafe();
   GPS();
+
+  //Loop test section------------------
+  phi_Input = phi_k;
+  theta_Input = theta_k;
+
+  phi_Setpoint = roll_des;
+  theta_Setpoint = pitch_des;
+  myphiPID.Compute();
+  mythetaPID.Compute();
+  Serial.println(phi_PID*(180/PI));
+  Serial.println(theta_PID*(180/PI));
+  //-----------------------------------
+
 //--------Serial Monitor--------
-  PrintSensorData();
+  //PrintSensorData();
   printStates();
-  //printPPM();
+  printPPM();
   //printGPS();
   //printDes();
 }
@@ -328,8 +367,7 @@ void BMPdata() {
 /*
 ============================================================
 🛩 Receiver Loop
-============================================================
-*/
+============================================================*/
 void PPMinput(){
   static unsigned long lastPPMtime = 0;
   const unsigned long ppmInterval = 20;  // ms
@@ -348,7 +386,10 @@ void PPMinput(){
   ch8 = ReceiverValue[7];
 }
 
-
+/*
+============================================================
+🛩 GPS Loop
+============================================================*/
 void GPS() {
   while (gpsSerial.available()) {
     gps.encode(gpsSerial.read());
@@ -375,23 +416,57 @@ void GPS() {
 ============================================================
 🛩 Phi(Roll) Theta(Pitch) Psi(Yaw)
 ============================================================*/
-void KalmanFilter() {
+void AngleEstimate() {
   //Angle from IMU (rad)
   phi_a = atan2(-accy,sqrt(accx*accx + accz*accz));
   theta_a = atan2(accx,sqrt(accy*accy + accz*accz));
-
+  //Angle from Mag (rad)
   psi_m = atan2(-magy, magx);
 }
+
+void kalman_1d(float KalmanState, float KalmanUncertainty, float KalmanInput, float KalmanMeasurement) {
+  KalmanState=KalmanState+0.004*KalmanInput;
+  KalmanUncertainty=KalmanUncertainty + 0.004 * 0.004 * 2 * 2;
+  float KalmanGain=KalmanUncertainty * 1/(1*KalmanUncertainty + 1 * 1);
+  KalmanState=KalmanState+KalmanGain * (KalmanMeasurement-KalmanState);
+  KalmanUncertainty=(1-KalmanGain) * KalmanUncertainty;
+  Kalman1DOutput[0]=KalmanState; 
+  Kalman1DOutput[1]=KalmanUncertainty;
+}
+
+void Phi_Theta_Est() {
+  kalman_1d(phi_k, phi_k_U, gyrox, phi_a);
+  phi_k=Kalman1DOutput[0]; 
+  phi_k_U=Kalman1DOutput[1];
+  kalman_1d(theta_k, theta_k_U, gyroy, theta_a);
+  theta_k=Kalman1DOutput[0]; 
+  theta_k_U=Kalman1DOutput[1];
+}
+
+
+
+/*
+========================================================================================================================
+
+                                                  Controller
+
+========================================================================================================================*/
+
+/*
+============================================================
+🛩 PID
+============================================================*/
+
 
 /*
 ============================================================
 🛩 Control Mixer Loop
 ============================================================*/
 void controlMixer() {
-  m1_command_scaled = thro_des + roll_des/maxRoll*0.1 - pitch_des/maxPitch*0.1 - yaw_des/maxYaw*0.1;//FL
-  m2_command_scaled = thro_des + roll_des/maxRoll*0.1 + pitch_des/maxPitch*0.1 + yaw_des/maxYaw*0.1;//BL
-  m3_command_scaled = thro_des - roll_des/maxRoll*0.1 - pitch_des/maxPitch*0.1 + yaw_des/maxYaw*0.1;//FR
-  m4_command_scaled = thro_des - roll_des/maxRoll*0.1 + pitch_des/maxPitch*0.1 - yaw_des/maxYaw*0.1;//BR
+  m1_command_scaled = thro_des + phi_PID + theta_PID - yaw_des;//FL
+  m2_command_scaled = thro_des + phi_PID - theta_PID + yaw_des;//BL
+  m3_command_scaled = thro_des - phi_PID + theta_PID + yaw_des;//FR
+  m4_command_scaled = thro_des - phi_PID - theta_PID - yaw_des;//BR
   m5_command_scaled = 0;
 
   //0.5 is centered servo, 0.0 is zero throttle if connecting to ESC for conventional PWM, 1.0 is max throttle
@@ -453,7 +528,7 @@ void scaleCommands() {
 void getDesState() {
   thro_des = (ch3 - 1000.0)/1000.0; //Between 0 and 1
   roll_des = (ch1 - 1500.0)/500.0; //Between -1 and 1
-  pitch_des = (ch2 - 1500.0)/500.0; //Between -1 and 1
+  pitch_des = -(ch2 - 1500.0)/500.0; //Between -1 and 1
   yaw_des = (ch4 - 1500.0)/500.0; //Between -1 and 1
 
   thro_des = constrain(thro_des, 0.0, 1.0); //Between 0 and 1
@@ -647,9 +722,13 @@ void PrintSensorData() {
 void printStates() {
   Serial.println("");
   Serial.println("Phi(roll)\tTheta(pitch)\tPsi(yaw)");
-  Serial.print(phi_a/(PI/180)); Serial.print("\t\t");
-  Serial.print(theta_a/(PI/180)); Serial.print("\t\t");
-  Serial.print(psi_m/(PI/180)); Serial.print("\t");
+  //Serial.print(phi_a/(PI/180)); Serial.print("\t\t");
+  //Serial.print(theta_a/(PI/180)); Serial.print("\t\t");
+  //Serial.print(psi_m/(PI/180)); Serial.print("\t");
+  //Serial.print("\n");
+  Serial.print(phi_k/(PI/180)); Serial.print("\t\t");
+  Serial.print(theta_k/(PI/180)); Serial.print("\t\t");
+  Serial.print(psi_m/(PI/180)); Serial.println("\t");
   Serial.print("\n");
 }
 
